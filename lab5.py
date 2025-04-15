@@ -1,6 +1,4 @@
-﻿python
-Copy
-import csv
+﻿import csv
 import sys
 
 
