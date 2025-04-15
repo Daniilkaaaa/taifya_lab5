@@ -1,0 +1,2 @@
+dispatcher: python3.13
+script: lab5.py
