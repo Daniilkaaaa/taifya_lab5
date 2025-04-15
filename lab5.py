@@ -1,235 +1,271 @@
-﻿from collections import deque
-from typing import Dict, List, Set, Optional
+﻿python
+Copy
+import csv
+import sys
 
-class NodeForRegex:
-    """Узел для представления AST регулярного выражения"""
-    def __init__(self, val: str, l_child: Optional['NodeForRegex'] = None, r_child: Optional['NodeForRegex'] = None):
-        self.val = val
-        self.l_child = l_child
-        self.r_child = r_child
 
-    def __repr__(self):
-        return f"Node({self.val})"
+class AutomatonExporter:
+    @staticmethod
+    def save_to_csv(automaton_data, output_path, initial_state):
+        input_symbols = AutomatonExporter._collect_input_symbols(automaton_data)
 
-class ParserForRegex:
-    """Парсер регулярных выражений с построением AST"""
-    SPECIAL_SYMBOLS = {'+', '*', '(', ')', '|'}
+        states_order = [initial_state] + [s for s in automaton_data if s != initial_state]
 
+        with open(output_path, mode='w', newline='', encoding='utf-8') as file:
+            csv_writer = csv.writer(file, delimiter=';')
+
+            # Write output row
+            outputs = [''] + [automaton_data[s]['output'] for s in states_order]
+            csv_writer.writerow(outputs)
+
+            # Write header row
+            headers = [''] + states_order
+            csv_writer.writerow(headers)
+
+            # Write transition rows
+            for symbol in sorted(input_symbols):
+                row = [symbol]
+                for state in states_order:
+                    transitions = [
+                        t['nextPos']
+                        for t in automaton_data[state]['transitions']
+                        if t['inputSym'] == symbol
+                    ]
+                    row.append(','.join(transitions) if transitions else '')
+                csv_writer.writerow(row)
+
+        print(f"Automaton data saved to {output_path}")
+
+    @staticmethod
+    def _collect_input_symbols(automaton_data):
+        symbols = set()
+        for state in automaton_data.values():
+            for transition in state['transitions']:
+                symbols.add(transition['inputSym'])
+        return symbols
+
+
+class RegexParser:
     def __init__(self):
-        self.token_queue = deque()
+        self.state_id = 1
 
-    def parse(self, expr: str) -> NodeForRegex:
-        """Основной метод парсинга"""
-        self.token_queue = deque(expr)
-        return self._parse_expr()
+    def process_pattern(self, pattern):
+        return self._parse_alternatives(pattern)
 
-    def _parse_expr(self) -> NodeForRegex:
-        """Разбор выражения с учётом оператора ИЛИ"""
-        left_node = self._parse_term()
-        while self.token_queue and self.token_queue[0] == '|':
-            self.token_queue.popleft()
-            right_node = self._parse_term()
-            left_node = NodeForRegex("OR_OP", left_node, right_node)
-        return left_node
+    def _parse_alternatives(self, expression):
+        components = []
+        current = []
+        nesting_level = 0
 
-    def _parse_term(self) -> NodeForRegex:
-        """Разбор последовательности терминов"""
-        left_node = self._parse_factor()
-        while self.token_queue and (self._is_regular_char(self.token_queue[0]) or self.token_queue[0] == '('):
-            right_node = self._parse_factor()
-            left_node = NodeForRegex("CONCAT_OP", left_node, right_node)
-        return left_node
+        for char in expression:
+            if char == "(":
+                nesting_level += 1
+            elif char == ")":
+                nesting_level -= 1
+            elif char == "|" and nesting_level == 0:
+                components.append("".join(current))
+                current = []
+                continue
+            current.append(char)
 
-    def _parse_factor(self) -> NodeForRegex:
-        """Разбор элементов с операторами * и +"""
-        node = self._parse_primary()
-        while self.token_queue and (self.token_queue[0] == '*' or self.token_queue[0] == '+'):
-            op = "STAR_OP" if self.token_queue.popleft() == '*' else "PLUS_OP"
-            node = NodeForRegex(op, node)
-        return node
+        components.append("".join(current))
 
-    def _parse_primary(self) -> NodeForRegex:
-        """Разбор атомарных элементов и группировок"""
-        if not self.token_queue:
-            raise ValueError("Неожиданный конец выражения")
+        if len(components) > 1:
+            return {
+                "type": "OR",
+                "first": self._parse_sequence(components[0]),
+                "second": self._parse_alternatives("|".join(components[1:]))
+            }
+        return self._parse_sequence(expression)
 
-        current_token = self.token_queue.popleft()
-        if current_token == '\\':
-            if not self.token_queue:
-                raise ValueError("Отсутствует экранируемый символ")
-            esc_char = self.token_queue.popleft()
-            if self._is_regular_char(esc_char):
-                self.token_queue.appendleft(esc_char)
+    def _parse_sequence(self, expression):
+        elements = []
+        position = 0
+
+        while position < len(expression):
+            if expression[position] == "(":
+                end_pos = self._find_matching_parenthesis(expression, position)
+                sub_expr = expression[position + 1:end_pos]
+                elements.append(
+                    self._parse_alternatives(sub_expr) if sub_expr else
+                    {"type": "LITERAL", "value": "ε"}
+                )
+                position = end_pos + 1
+            elif expression[position] in "*+":
+                if not elements:
+                    raise ValueError(f"Invalid operator at position {position}")
+                op_type = "STAR" if expression[position] == "*" else "PLUS"
+                elements[-1] = {"type": op_type, "child": elements[-1]}
+                position += 1
             else:
-                return NodeForRegex(esc_char)
+                elements.append({"type": "LITERAL", "value": expression[position]})
+                position += 1
 
-        if self._is_regular_char(current_token):
-            return NodeForRegex(current_token)
-        elif current_token == '(':
-            inner_node = self._parse_expr()
-            if not self.token_queue or self.token_queue.popleft() != ')':
-                raise ValueError("Несбалансированные скобки")
-            return inner_node
+        return self._build_sequence_tree(elements) if len(elements) > 1 else elements[0]
 
-        raise ValueError(f"Недопустимый символ: {current_token}")
+    def _build_sequence_tree(self, elements):
+        if len(elements) == 1:
+            return elements[0]
+        return {
+            "type": "CONCAT",
+            "first": elements[0],
+            "second": self._build_sequence_tree(elements[1:])
+        }
 
-    def _is_regular_char(self, char: str) -> bool:
-        """Проверка на обычный символ (не оператор)"""
-        return char not in self.SPECIAL_SYMBOLS
+    def _find_matching_parenthesis(self, expr, start):
+        depth = 1
+        for i in range(start + 1, len(expr)):
+            if expr[i] == "(":
+                depth += 1
+            elif expr[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        raise ValueError("Parentheses mismatch")
 
-class AutomataState:
-    """Состояние НКА"""
-    def __init__(self):
-        self.char_transitions: Dict[str, List['AutomataState']] = {}
-        self.eps_transitions: List['AutomataState'] = []
-
-    def add_char_transition(self, symbol: str, target: 'AutomataState'):
-        """Добавление перехода по символу"""
-        if symbol not in self.char_transitions:
-            self.char_transitions[symbol] = []
-        self.char_transitions[symbol].append(target)
-
-    def add_eps_transition(self, target: 'AutomataState'):
-        """Добавление ε-перехода"""
-        self.eps_transitions.append(target)
-
-class NFA:
-    """Недетерминированный конечный автомат"""
-    def __init__(self, init_state: AutomataState, final_state: AutomataState):
-        self.init_state = init_state
-        self.final_state = final_state
 
 class NFABuilder:
-    """Построитель НКА по AST"""
-    def construct(self, node: NodeForRegex) -> NFA:
-        """Основной метод построения НКА"""
-        if node.val == "CONCAT_OP":
-            return self._build_concat(self.construct(node.l_child), self.construct(node.r_child))
-        elif node.val == "OR_OP":
-            return self._build_alternation(self.construct(node.l_child), self.construct(node.r_child))
-        elif node.val == "STAR_OP":
-            return self._build_star(self.construct(node.l_child))
-        elif node.val == "PLUS_OP":
-            return self._build_plus(self.construct(node.l_child))
-        else:
-            return self._build_single_char(node.val)
+    def __init__(self):
+        self.state_counter = 1
+        self.automaton = {}
 
-    def _build_single_char(self, char: str) -> NFA:
-        """Построение НКА для одиночного символа"""
-        s1 = AutomataState()
-        s2 = AutomataState()
-        s1.add_char_transition(char, s2)
-        return NFA(s1, s2)
+    def create_state(self):
+        state_id = f"s{self.state_counter}"
+        self.state_counter += 1
+        return {
+            "state": state_id,
+            "output": '',
+            "transitions": []
+        }
 
-    def _build_concat(self, first: NFA, second: NFA) -> NFA:
-        """Конкатенация двух НКА"""
-        first.final_state.add_eps_transition(second.init_state)
-        return NFA(first.init_state, second.final_state)
+    def add_epsilon_transition(self, from_state, to_state):
+        self.automaton[from_state]['transitions'].append({
+            'inputSym': 'ε',
+            'nextPos': to_state
+        })
 
-    def _build_alternation(self, first: NFA, second: NFA) -> NFA:
-        """Альтернация (ИЛИ) двух НКА"""
-        new_start = AutomataState()
-        new_end = AutomataState()
-        new_start.add_eps_transition(first.init_state)
-        new_start.add_eps_transition(second.init_state)
-        first.final_state.add_eps_transition(new_end)
-        second.final_state.add_eps_transition(new_end)
-        return NFA(new_start, new_end)
+    def construct_from_regex(self, regex_tree):
+        start_state = self.create_state()
+        final_state = self.create_state()
 
-    def _build_star(self, nfa: NFA) -> NFA:
-        """Операция звезды Клини"""
-        new_start = AutomataState()
-        new_end = AutomataState()
-        new_start.add_eps_transition(nfa.init_state)
-        new_start.add_eps_transition(new_end)
-        nfa.final_state.add_eps_transition(nfa.init_state)
-        nfa.final_state.add_eps_transition(new_end)
-        return NFA(new_start, new_end)
+        self.automaton[start_state['state']] = start_state
+        self.automaton[final_state['state']] = final_state
 
-    def _build_plus(self, nfa: NFA) -> NFA:
-        """Операция плюс (одно или более)"""
-        new_start = AutomataState()
-        new_end = AutomataState()
-        new_start.add_eps_transition(nfa.init_state)
-        nfa.final_state.add_eps_transition(nfa.init_state)
-        nfa.final_state.add_eps_transition(new_end)
-        return NFA(new_start, new_end)
+        nfa_data = self._build_nfa(regex_tree, start_state['state'], final_state['state'])
 
-class NFAExporter:
-    """Экспорт НКА в файл"""
-    @staticmethod
-    def _assign_state_ids(start_state: AutomataState) -> Dict[AutomataState, str]:
-        """Присвоение идентификаторов состояниям"""
-        state_ids = {}
-        counter = 0
-        stack = [start_state]
+        return nfa_data, start_state['state'], final_state['state']
 
-        while stack:
-            current = stack.pop()
-            if current not in state_ids:
-                state_ids[current] = f"S{counter}"
-                counter += 1
-                for targets in current.char_transitions.values():
-                    for t in targets:
-                        if t not in state_ids:
-                            stack.append(t)
-                for t in current.eps_transitions:
-                    if t not in state_ids:
-                        stack.append(t)
+    def _build_nfa(self, node, entry_point, exit_point):
+        if node['type'] == 'LITERAL':
+            temp_start = self.create_state()
+            temp_end = self.create_state()
 
-        return state_ids
+            self.automaton[temp_start['state']] = temp_start
+            self.automaton[temp_end['state']] = temp_end
 
-    @staticmethod
-    def save_to_file(nfa: NFA, filename: str):
-        state_ids = NFAExporter._assign_state_ids(nfa.init_state)
-        accepting_state = state_ids[nfa.final_state]
+            temp_start['transitions'].append({
+                'inputSym': node['value'],
+                'nextPos': temp_end['state']
+            })
 
-        transitions: Dict[str, Dict[str, Set[str]]] = {}
-        for state, id_ in state_ids.items():
-            transitions[id_] = {}
-            for symbol, targets in state.char_transitions.items():
-                transitions[id_][symbol] = {state_ids[t] for t in targets}
-            if state.eps_transitions:
-                transitions[id_]['ε'] = {state_ids[t] for t in state.eps_transitions}
+            self.add_epsilon_transition(entry_point, temp_start['state'])
+            self.add_epsilon_transition(temp_end['state'], exit_point)
 
-        symbols = set()
-        for trans in transitions.values():
-            symbols.update(trans.keys())
+            return self.automaton
 
-        with open(filename, 'w', encoding='utf-8') as f:
-            # Запись строки с пометками финальных состояний
-            f.write(";" + ";".join("1" if s == accepting_state else "0" for s in state_ids.values()) + "\n")
-            # Запись строки с идентификаторами состояний
-            f.write(";" + ";".join(state_ids.values()) + "\n")
+        elif node['type'] == 'CONCAT':
+            middle_state = self.create_state()
+            self.automaton[middle_state['state']] = middle_state
 
-            # Запись переходов для каждого символа
-            for symbol in sorted(symbols):
-                row = [symbol]
-                for state_id in state_ids.values():
-                    targets = transitions[state_id].get(symbol, set())
-                    row.append(",".join(sorted(targets)))
-                f.write(";".join(row) + "\n")
+            self._build_nfa(node['first'], entry_point, middle_state['state'])
+            self._build_nfa(node['second'], middle_state['state'], exit_point)
 
-def process_regex(args: List[str]):
-    if len(args) < 2:
-        print("Использование: python script.py <выходной_файл> <регулярное_выражение>")
-        return
+            return self.automaton
 
-    output_file = args[0]
-    regex_pattern = args[1]
+        elif node['type'] == 'OR':
+            left_entry = self.create_state()
+            left_exit = self.create_state()
+            right_entry = self.create_state()
+            right_exit = self.create_state()
 
-    try:
-        parser = ParserForRegex()
-        syntax_tree = parser.parse(regex_pattern)
+            self.automaton.update({
+                left_entry['state']: left_entry,
+                left_exit['state']: left_exit,
+                right_entry['state']: right_entry,
+                right_exit['state']: right_exit
+            })
 
-        builder = NFABuilder()
-        nfa_automaton = builder.construct(syntax_tree)
+            self.add_epsilon_transition(entry_point, left_entry['state'])
+            self.add_epsilon_transition(entry_point, right_entry['state'])
 
-        NFAExporter.save_to_file(nfa_automaton, output_file)
-        print(f"НКА успешно сохранён в {output_file}")
-    except Exception as e:
-        print(f"Ошибка: {str(e)}")
+            self._build_nfa(node['first'], left_entry['state'], left_exit['state'])
+            self._build_nfa(node['second'], right_entry['state'], right_exit['state'])
+
+            self.add_epsilon_transition(left_exit['state'], exit_point)
+            self.add_epsilon_transition(right_exit['state'], exit_point)
+
+            return self.automaton
+
+        elif node['type'] == 'STAR':
+            loop_entry = self.create_state()
+            loop_exit = self.create_state()
+
+            self.automaton.update({
+                loop_entry['state']: loop_entry,
+                loop_exit['state']: loop_exit
+            })
+
+            self.add_epsilon_transition(entry_point, loop_entry['state'])
+            self.add_epsilon_transition(entry_point, exit_point)
+
+            self._build_nfa(node['child'], loop_entry['state'], loop_exit['state'])
+
+            self.add_epsilon_transition(loop_exit['state'], loop_entry['state'])
+            self.add_epsilon_transition(loop_exit['state'], exit_point)
+
+            return self.automaton
+
+        elif node['type'] == 'PLUS':
+            loop_entry = self.create_state()
+            loop_exit = self.create_state()
+
+            self.automaton.update({
+                loop_entry['state']: loop_entry,
+                loop_exit['state']: loop_exit
+            })
+
+            self.add_epsilon_transition(entry_point, loop_entry['state'])
+
+            self._build_nfa(node['child'], loop_entry['state'], loop_exit['state'])
+
+            self.add_epsilon_transition(loop_exit['state'], loop_entry['state'])
+            self.add_epsilon_transition(loop_exit['state'], exit_point)
+
+            return self.automaton
+
+
+def execute():
+    if len(sys.argv) != 3:
+        print('Usage: python script.py <output.csv> "<regular_expression>"')
+        sys.exit(1)
+
+    output_path = sys.argv[1]
+    regex_pattern = sys.argv[2]
+
+    # Parse regular expression
+    parser = RegexParser()
+    syntax_tree = parser.process_pattern(regex_pattern)
+
+    # Build NFA
+    builder = NFABuilder()
+    nfa_data, start_state, final_state = builder.construct_from_regex(syntax_tree)
+
+    # Mark final state
+    nfa_data[final_state]['output'] = "F"
+
+    # Export to CSV
+    AutomatonExporter.save_to_csv(nfa_data, output_path, start_state)
+
 
 if __name__ == "__main__":
-    import sys
-    process_regex(sys.argv[1:])
+    execute()
